@@ -1,17 +1,49 @@
 import struct, zlib, os, sys, json
 
-EXE_DIR_VA   = 0x004BFE50
-EXE_IMGBASE  = 0x00400000
-RDATA_RAW    = 0x000A9000
-RDATA_VA     = 0x000AA000
-EXE_DIR_FOFF = EXE_DIR_VA - RDATA_VA - EXE_IMGBASE + RDATA_RAW
 ENT_SIZE     = 24
 ALIGN        = 8
 ZLIB_2ND     = (0x01, 0x9C, 0xDA)
+ANCHOR_KEY   = 0xAB4CD424
+EXE_DIR_FOFF_GOG = 0xBEE50
 
 
-def read_directory(exe_bytes):
-    o = EXE_DIR_FOFF
+def _u32(b, o):
+    return struct.unpack_from('<I', b, o)[0]
+
+
+def find_dir_foff(exe_bytes):
+    def plausible(j):
+        if j < ENT_SIZE or j + 2 * ENT_SIZE > len(exe_bytes):
+            return False
+        key, a, b, off, d, flags = struct.unpack_from('<6I', exe_bytes, j)
+        pk = _u32(exe_bytes, j - ENT_SIZE)
+        nk = _u32(exe_bytes, j + ENT_SIZE)
+        return key == ANCHOR_KEY and pk < key < nk and flags < 8 and a < 10 ** 8
+    needle = struct.pack('<I', ANCHOR_KEY)
+    cands = []
+    if EXE_DIR_FOFF_GOG < len(exe_bytes):
+        cands.append(EXE_DIR_FOFF_GOG)
+    i = 0
+    while True:
+        j = exe_bytes.find(needle, i)
+        if j < 0:
+            break
+        i = j + 1
+        if plausible(j):
+            start = j
+            while start - ENT_SIZE >= 0:
+                pk = _u32(exe_bytes, start - ENT_SIZE)
+                ck = _u32(exe_bytes, start)
+                if 0 < pk < ck:
+                    start -= ENT_SIZE
+                else:
+                    break
+            return start
+    raise RuntimeError('file directory not found in exe (unknown build?)')
+
+
+def read_directory(exe_bytes, foff=None):
+    o = foff if foff is not None else find_dir_foff(exe_bytes)
     out = []
     prev = -1
     k = 0
@@ -31,8 +63,8 @@ def read_directory(exe_bytes):
     return out
 
 
-def entry_offset_in_exe(slot_idx):
-    return EXE_DIR_FOFF + slot_idx * ENT_SIZE
+def entry_offset_in_exe(slot_idx, foff):
+    return foff + slot_idx * ENT_SIZE
 
 
 def _zlib_consumed(buf, off):
@@ -88,7 +120,8 @@ def physical_files(kpk, directory):
 def unpack(kpk_path, exe_path):
     kpk = open(kpk_path, 'rb').read()
     exe = open(exe_path, 'rb').read()
-    directory = read_directory(exe)
+    dir_foff = find_dir_foff(exe)
+    directory = read_directory(exe, dir_foff)
     top = physical_files(kpk, directory)
     files = []
     cursor = 0
@@ -105,7 +138,8 @@ def unpack(kpk_path, exe_path):
             on_disk_len=len(on_disk), pad_len=len(pad), pad=pad,
             entry_idx=e['idx'], a=e['a'], b=e['b'], d=e['d'], flags=e['flags']))
         cursor = nxt_start if nxt_start is not None else end
-    return dict(directory=directory, files=files, tail=kpk[cursor:], kpk_size=len(kpk))
+    return dict(directory=directory, files=files, tail=kpk[cursor:], kpk_size=len(kpk),
+                dir_foff=dir_foff)
 
 
 def unpack_exact(kpk_path, exe_path):
@@ -171,10 +205,12 @@ def repack_multi(unpacked, replacements):
     return bytes(out), dir_patches
 
 
-def patch_exe_directory(exe_bytes, dir_patches):
+def patch_exe_directory(exe_bytes, dir_patches, foff=None):
     exe = bytearray(exe_bytes)
+    if foff is None:
+        foff = find_dir_foff(exe)
     for p in dir_patches:
-        base = entry_offset_in_exe(p['entry_idx'])
+        base = entry_offset_in_exe(p['entry_idx'], foff)
         struct.pack_into('<I', exe, base + 0x04, p['a'])
         struct.pack_into('<I', exe, base + 0x08, p['b'])
         struct.pack_into('<I', exe, base + 0x0C, p['off'])

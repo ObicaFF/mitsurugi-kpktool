@@ -41,10 +41,24 @@ def dds_to_png(dds_path, png_path):
     sys.stderr.write('-> %s\n' % png_path)
 
 
+def png_to_dds(orig_dds, png_path, out_dds):
+    from PIL import Image
+    data = open(orig_dds, 'rb').read()
+    h = struct.unpack_from('<I', data, 12)[0]
+    w = struct.unpack_from('<I', data, 16)[0]
+    fourcc = data[84:88].decode('latin1', 'replace')
+    if fourcc not in ('DXT1', 'DXT5'):
+        raise SystemExit('unsupported DDS format: %r' % fourcc)
+    img = Image.open(png_path).convert('RGBA').resize((w, h))
+    img.save(out_dds, format='DDS', pixel_format=fourcc)
+    sys.stderr.write('wrote %s (%dx%d %s)\n' % (out_dds, w, h, fourcc))
+
+
 if __name__ == '__main__':
     a = sys.argv
     if len(a) < 2:
-        print('usage: textool.py tex2png in.tex out.png | png2tex orig.tex in.png out.tex | dds2png in.dds out.png')
+        print('usage: textool.py tex2png in.tex out.png | png2tex orig.tex in.png out.tex | '
+              'dds2png in.dds out.png | png2dds orig.dds in.png out.dds')
         sys.exit(1)
     if a[1] == 'tex2png':
         to_png(a[2], a[3])
@@ -52,5 +66,7 @@ if __name__ == '__main__':
         encode(a[2], a[3], a[4])
     elif a[1] == 'dds2png':
         dds_to_png(a[2], a[3])
+    elif a[1] == 'png2dds':
+        png_to_dds(a[2], a[3], a[4])
     else:
         print('unknown command', a[1]); sys.exit(1)

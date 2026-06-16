@@ -42,6 +42,7 @@ class App(tk.Tk):
         self.files = []
         self.by_key = {}
         self.edits = {}
+        self.bin_edits = {}
         self.ref_by_key = {}
         self.ref_name = ''
         self.preview_img = None
@@ -54,7 +55,8 @@ class App(tk.Tk):
         for txt, cmd in [('Open kpk+exe', self.open_archive),
                          ('Load reference', self.load_reference),
                          ('Build patch', self.build_patch), ('Diff with...', self.diff_with),
-                         ('Export PNG', self.export_png),
+                         ('Extract file', self.extract_file), ('Extract all...', self.extract_all),
+                         ('Export PNG', self.export_png), ('Import PNG', self.import_texture),
                          ('Export text JSON', self.export_json), ('Import text JSON', self.import_json)]:
             ttk.Button(bar, text=txt, command=cmd).pack(side='left', padx=2)
         self.filter_var = tk.StringVar()
@@ -62,8 +64,9 @@ class App(tk.Tk):
         ttk.Entry(bar, textvariable=self.filter_var, width=14).pack(side='right')
         ttk.Label(bar, text='filter:').pack(side='right')
         self.cat_var = tk.StringVar(value='all')
-        cb = ttk.Combobox(bar, textvariable=self.cat_var, values=CATEGORIES, width=8, state='readonly')
-        cb.pack(side='right', padx=4); cb.bind('<<ComboboxSelected>>', lambda *a: self.refresh_list())
+        self.cat_cb = ttk.Combobox(bar, textvariable=self.cat_var, values=CATEGORIES, width=10, state='readonly')
+        self.cat_cb.pack(side='right', padx=4)
+        self.cat_cb.bind('<<ComboboxSelected>>', lambda *a: self.refresh_list())
         ttk.Label(bar, text='type:').pack(side='right')
 
         info = ttk.Frame(self); info.pack(fill='x', padx=6)
@@ -134,11 +137,13 @@ class App(tk.Tk):
         self.files = self.unpacked['files']
         self.by_key = {f['key']: f for f in self.files}
         self.edits = {}
+        self.bin_edits = {}
         from collections import Counter
-        c = Counter(); lines = 0
+        c = Counter(); types = set(); lines = 0
         for f in self.files:
-            raw = bytes(f['raw_bytes']); t = sniff(raw); c[category(raw, t)] += 1
+            raw = bytes(f['raw_bytes']); t = sniff(raw); c[category(raw, t)] += 1; types.add(t)
             if t in ('b04', 'e3'): lines += len(strings_of(raw, t))
+        self.cat_cb['values'] = CATEGORIES + ['--'] + sorted(types)
         self.summary.set('%d files | %d text lines | %s' %
                          (len(self.files), lines, ' '.join('%s:%d' % (k, v) for k, v in c.most_common())))
         self.refresh_list()
@@ -160,9 +165,12 @@ class App(tk.Tk):
         cat = self.cat_var.get()
         for i, f in enumerate(self.files):
             raw = bytes(f['raw_bytes']); t = sniff(raw); cc = category(raw, t)
-            if cat != 'all' and cc != cat:
-                continue
-            ed = '*' if f['key'] in self.edits else ''
+            if cat not in ('all', '--'):
+                if cat in CATEGORIES:
+                    if cc != cat: continue
+                elif t != cat:
+                    continue
+            ed = '*' if (f['key'] in self.edits or f['key'] in self.bin_edits) else ''
             row = ('%05d' % i, '%08x' % f['key'], cc, t, str(len(f['raw_bytes'])), ed)
             if flt and flt not in ' '.join(row).lower():
                 continue
@@ -170,14 +178,17 @@ class App(tk.Tk):
 
     def sort_by(self, col):
         items = [(self.tree.set(k, col), k) for k in self.tree.get_children('')]
-        self.sort_rev = not self.sort_rev if self.sort_col == col else False
+        self.sort_rev = (not self.sort_rev) if self.sort_col == col else False
         self.sort_col = col
         def keyf(v):
             try: return (0, int(v[0]))
-            except Exception: return (1, v[0])
+            except Exception: return (1, v[0].lower())
         items.sort(key=keyf, reverse=self.sort_rev)
         for idx, (_, k) in enumerate(items):
             self.tree.move(k, '', idx)
+        for c in ('idx', 'key', 'cat', 'type', 'size', 'ed'):
+            arrow = (' ▼' if self.sort_rev else ' ▲') if c == col else ''
+            self.tree.heading(c, text=c + arrow)
 
     def _cur(self):
         sel = self.tree.selection()
@@ -214,8 +225,8 @@ class App(tk.Tk):
                 mark = '* ' if (edited and i < len(orig) and s != orig[i]) else '  '
                 self.lb.insert('end', mark + s.replace('\n', ' / '))
             self.nb.select(self.tab_text)
-        elif t in ('tex', 'dds'):
-            self.show_image(raw, t)
+        elif t in ('tex', 'dds', 'png', 'bmp'):
+            self.show_image(self.bin_edits.get(f['key'], raw), t)
             self.nb.select(self.tab_img)
         elif raw[:2] == b'FM':
             self.show_font(raw)
@@ -227,7 +238,7 @@ class App(tk.Tk):
     def show_image(self, raw, t, maxsz=700):
         try:
             from PIL import Image, ImageTk
-            img = Image.open(io.BytesIO(raw)).convert('RGBA') if t == 'dds' else textool.decode(raw)[0]
+            img = textool.decode(raw)[0] if t == 'tex' else Image.open(io.BytesIO(raw)).convert('RGBA')
             bg = Image.new('RGBA', img.size, (42, 42, 50, 255))
             comp = Image.alpha_composite(bg, img).convert('RGB'); comp.thumbnail((maxsz, maxsz))
             self.preview_img = ImageTk.PhotoImage(comp)
@@ -290,7 +301,7 @@ class App(tk.Tk):
         self.status.set('edited %08x line %d (%d files unsaved)' % (f['key'], sel[0], len(self.edits)))
 
     def build_patch(self):
-        if not self.unpacked or not self.edits:
+        if not self.unpacked or (not self.edits and not self.bin_edits):
             messagebox.showinfo('build', 'no edits'); return
         out_kpk = filedialog.asksaveasfilename(defaultextension='.kpk', initialfile='data0.kpk')
         if not out_kpk: return
@@ -300,6 +311,7 @@ class App(tk.Tk):
             raw = bytes(self.by_key[key]['raw_bytes']); t = sniff(raw)
             tool = b04tool if t == 'b04' else e3tool
             m = tool.parse(raw); tool.set_strings(m, strs); repl[key] = tool.build(m)
+        repl.update(self.bin_edits)
         nk, patches = kpktool.repack_multi(self.unpacked, repl)
         ne = kpktool.patch_exe_directory(open(self.exe_path, 'rb').read(), patches)
         open(out_kpk, 'wb').write(nk); open(out_exe, 'wb').write(ne)
@@ -355,15 +367,92 @@ class App(tk.Tk):
         self.nb.select(self.tab_hex)
         self.status.set('%d matches for %r' % (len(hits), q))
 
-    def export_png(self):
+    def import_texture(self):
         f = self._cur()
         if f is None: return
         raw = bytes(f['raw_bytes']); t = sniff(raw)
-        if t not in ('tex', 'dds'): return
+        if t not in ('tex', 'dds'):
+            messagebox.showwarning('import', 'выбери .tex или .dds'); return
+        from PIL import Image
+        if t == 'tex':
+            w = struct.unpack_from('<H', raw, 12)[0]; h = struct.unpack_from('<H', raw, 14)[0]
+            fmt_note = 'tex %dx%d' % (w, h)
+        else:
+            h = struct.unpack_from('<I', raw, 12)[0]; w = struct.unpack_from('<I', raw, 16)[0]
+            fourcc = raw[84:88].decode('latin1', 'replace')
+            if fourcc not in ('DXT1', 'DXT5'):
+                messagebox.showwarning('import', 'DDS-формат %r не поддержан (только DXT1/DXT5)' % fourcc); return
+            fmt_note = 'dds %dx%d %s' % (w, h, fourcc)
+        png = filedialog.askopenfilename(title='PNG для %08x (%s)' % (f['key'], fmt_note),
+                                         filetypes=[('png', '*.png'), ('all', '*.*')])
+        if not png: return
+        try:
+            img = Image.open(png).convert('RGBA')
+        except Exception as e:
+            messagebox.showerror('import', 'не открылось как изображение:\n%s' % e); return
+        if img.size != (w, h):
+            if not messagebox.askyesno('проверка',
+                    'Размеры НЕ совпадают!\nPNG: %dx%d\nатлас: %dx%d\n\n'
+                    'Возможно подсунул не тот файл.\nВсё равно вставить (с ресайзом до %dx%d)?'
+                    % (img.width, img.height, w, h, w, h)):
+                self.status.set('импорт отменён (размер не совпал)'); return
+            img = img.resize((w, h))
+        if t == 'tex':
+            hdr = len(raw) - w * h * 4
+            r, g, b, a = img.split()
+            new = raw[:hdr] + bytes(Image.merge('RGBA', (b, g, r, a)).tobytes())
+            if len(new) != len(raw):
+                messagebox.showerror('import', 'размер не сошёлся (%d != %d)' % (len(new), len(raw))); return
+        else:
+            buf = io.BytesIO(); img.save(buf, format='DDS', pixel_format=fourcc); new = buf.getvalue()
+        self.bin_edits[f['key']] = new
+        self.refresh_list()
+        self.show_image(new, t); self.nb.select(self.tab_img)
+        self.status.set('импортирован PNG в %08x (%s, ок)' % (f['key'], fmt_note))
+
+    def extract_file(self):
+        f = self._cur()
+        if f is None: return
+        raw = bytes(f['raw_bytes']); t = sniff(raw)
+        out = filedialog.asksaveasfilename(initialfile='%08x.%s' % (f['key'], t),
+                                           defaultextension='.' + t)
+        if not out: return
+        open(out, 'wb').write(raw)
+        self.status.set('extracted %08x (%d bytes) -> %s' % (f['key'], len(raw), out))
+
+    def extract_all(self):
+        if not self.files: return
+        d = filedialog.askdirectory(title='extract all files into...')
+        if not d: return
+        cat = self.cat_var.get()
+        n = 0
+        manifest = []
+        for i, f in enumerate(self.files):
+            raw = bytes(f['raw_bytes']); t = sniff(raw)
+            if cat not in ('all', '--'):
+                if cat in CATEGORIES:
+                    if category(raw, t) != cat: continue
+                elif t != cat:
+                    continue
+            name = '%05d_%08x.%s' % (i, f['key'], t)
+            open(os.path.join(d, name), 'wb').write(raw)
+            manifest.append(dict(i=i, key='%08x' % f['key'], type=t,
+                                 cat=category(raw, t), size=len(raw), name=name))
+            n += 1
+        json.dump(manifest, io.open(os.path.join(d, 'manifest.json'), 'w', encoding='utf-8'), indent=1)
+        self.status.set('extracted %d files (%s) -> %s' % (n, cat, d))
+        messagebox.showinfo('extract all', 'extracted %d files into\n%s' % (n, d))
+
+    def export_png(self):
+        f = self._cur()
+        if f is None: return
+        raw = bytes(self.bin_edits.get(f['key'], f['raw_bytes'])); t = sniff(raw)
+        if t not in ('tex', 'dds', 'png', 'bmp'): return
         out = filedialog.asksaveasfilename(defaultextension='.png')
         if not out: return
         from PIL import Image
-        (Image.open(io.BytesIO(raw)).convert('RGBA') if t == 'dds' else textool.decode(raw)[0]).save(out)
+        img = textool.decode(raw)[0] if t == 'tex' else Image.open(io.BytesIO(raw)).convert('RGBA')
+        img.save(out)
         self.status.set('saved ' + out)
 
     def diff_with(self):
